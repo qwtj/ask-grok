@@ -1,0 +1,330 @@
+#!/usr/bin/env zsh
+
+# Function to display help
+usage() {
+    echo "Usage: $0 [-m <model name>] [-g] [-f <attached_File>] [-i] <prompt>"
+    echo "  <prompt>: The text prompt to send to the Grok API."
+    echo "  -p <prompt path>     Provide a path to a file prompt."
+    echo "  -v: Enable verbose mode."
+    echo "  -h, --help: Display this help message."
+    echo "  -m <model name>: Specify the model (default: grok-3)"
+    echo "  -g: Use glow to display the output."
+    echo "  -f <attached_File>: Path to a file to include in the request."
+    echo "  -i: List available models for -m and exit."
+    exit 1
+}
+
+# Function to list available models
+list_available_models() {
+    local VERBOSE="$1"
+    local API_URL="https://api.x.ai/v1/models"
+    
+    if [[ -z "$XAI_API_KEY" ]]; then
+        echo "Warning: XAI_API_KEY not set. Cannot query models API." >&2
+        echo "Available models for -m (fallback):"
+        echo "  grok-3"
+        echo "Note: Set XAI_API_KEY and check https://x.ai/api for the latest models."
+        return 1
+    fi
+
+    [[ "$VERBOSE" = "true" ]] && echo "Querying models API: $API_URL" >&2
+    local RESPONSE=$(curl -s -X GET "$API_URL" \
+        -H "Authorization: Bearer $XAI_API_KEY" \
+        -H "Content-Type: application/json")
+
+    if [[ "$VERBOSE" = "true" ]]; then
+        echo "Raw models API response:" >&2
+        echo "$RESPONSE" >&2
+    fi
+
+    if echo "$RESPONSE" | jq . >/dev/null 2>&1; then
+        local MODELS=$(echo "$RESPONSE" | jq -r '.data[].id // .models[].id // empty')
+        if [[ -n "$MODELS" ]]; then
+            echo "Available models for -m:"
+            echo "$MODELS" | sort -u
+            echo "Note: Check https://x.ai/api for model details."
+            return 0
+        fi
+    fi
+
+    echo "Warning: Failed to retrieve models from API (endpoint may not exist)." >&2
+    echo "Available models for -m (fallback):"
+    echo "  grok-3"
+    echo "Note: Check https://x.ai/api for the latest models."
+    return 1
+}
+
+# Function to clean and escape content for JSON
+clean_and_escape_json() {
+    local input="$1"
+    # Remove control characters, null bytes, and other problematic characters
+    echo "$input" | tr -d '\0-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\n/\\n/g; s/\r/\\r/g' | jq -R -s '.'
+}
+
+# Function: send_grok_request
+send_grok_request() {
+    local MODEL="$1"
+    local VERBOSE="$2"
+    local REQ_FILE="$3"
+    local API_URL="https://api.x.ai/v1/chat/completions"
+
+    # Validate JSON in REQ_FILE
+    if ! jq . "$REQ_FILE" >/dev/null 2>&1; then
+        echo "Error: Invalid JSON in request body:" >&2
+        cat "$REQ_FILE" >&2
+        rm "$REQ_FILE"
+        return 1
+    fi
+
+    [[ "$VERBOSE" = "true" ]] && echo "\nSending Request:\n\n\tAPI URL: $API_URL\n\tRequest Body:" >&2
+    [[ "$VERBOSE" = "true" ]] && cat "$REQ_FILE" >&2
+
+    local RESPONSE=$(curl -s -X POST "$API_URL" \
+        -H "Authorization: Bearer $XAI_API_KEY" \
+        -H "Content-Type: application/json" \
+        --data-binary "@${REQ_FILE}")
+
+    if [[ "$VERBOSE" = "true" ]]; then
+        RESPONSE_FILE="$(mktemp -t "ask.grok")"
+        echo "$RESPONSE" > "$RESPONSE_FILE"
+        echo "\nRequest saved: ${REQ_FILE}" >&2
+        echo "Raw response saved to: ${RESPONSE_FILE}" >&2
+        if echo "$RESPONSE" | jq . >/dev/null 2>&1; then
+            echo "Parsed response:" >&2
+            echo "$RESPONSE" | jq . >&2
+        else
+            echo "Raw response (not valid JSON):" >&2
+            echo "$RESPONSE" >&2
+        fi
+    else
+        rm "$REQ_FILE"
+    fi
+
+    if ! echo "$RESPONSE" | jq . >/dev/null 2>&1; then
+        echo "Error: Invalid JSON response from API:" >&2
+        echo "$RESPONSE" >&2
+        return 1
+    fi
+
+    local TEXT_RESPONSE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content' 2>/dev/null)
+    if [ "$TEXT_RESPONSE" = "null" ]; then
+        echo "Error: No valid content in response:" >&2
+        echo "$RESPONSE" | jq >&2
+        return 1
+    fi
+
+    if [ -z "$TEXT_RESPONSE" ]; then
+        echo "Error: No text response received:" >&2
+        echo "$RESPONSE" >&2
+        return 1
+    fi
+
+    echo "$TEXT_RESPONSE" | base64
+}
+
+send_prompt_to_grok() {
+    local ENCODED_PROMPT="$1"
+    local MODEL="$2"
+    local VERBOSE="$3"
+
+    # Decode and clean the prompt
+    local RAW_PROMPT=$(echo "$ENCODED_PROMPT" | base64 --decode)
+    [[ "$VERBOSE" = "true" ]] && echo "Raw prompt content:\n$RAW_PROMPT" >&2
+    local PROMPT_CONTENT=$(clean_and_escape_json "$RAW_PROMPT")
+    [[ "$VERBOSE" = "true" ]] && echo "Escaped prompt content:\n$PROMPT_CONTENT" >&2
+
+    local REQ_BODY="{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": $PROMPT_CONTENT}]}"
+    TMP_FILE="$(mktemp -t "ask.grok")"
+    echo "$REQ_BODY" > "$TMP_FILE"
+    send_grok_request "$MODEL" "$VERBOSE" "$TMP_FILE"
+}
+
+send_prompt_with_file_to_grok() {
+    local ENCODED_PROMPT="$1"
+    local ATTACHED_FILE_PATH="$2"
+    local MODEL="$3"
+    local VERBOSE="$4"
+
+    # Decode and clean the prompt
+    local RAW_PROMPT=$(echo "$ENCODED_PROMPT" | base64 --decode)
+    [[ "$VERBOSE" = "true" ]] && echo "Raw prompt content:\n$RAW_PROMPT" >&2
+    local PROMPT_CONTENT=$(clean_and_escape_json "$RAW_PROMPT")
+    [[ "$VERBOSE" = "true" ]] && echo "Escaped prompt content:\n$PROMPT_CONTENT" >&2
+    local CONTENT=""
+
+    if [ -n "$ATTACHED_FILE_PATH" ]; then
+        if [ ! -f "$ATTACHED_FILE_PATH" ]; then
+            echo "Error: File not found: $ATTACHED_FILE_PATH" >&2
+            return 1
+        fi
+        local RAW_FILE_CONTENT=$(cat "$ATTACHED_FILE_PATH")
+        [[ "$VERBOSE" = "true" ]] && echo "Raw file content:\n$RAW_FILE_CONTENT" >&2
+        local FILE_CONTENT=$(clean_and_escape_json "$RAW_FILE_CONTENT")
+        [[ "$VERBOSE" = "true" ]] && echo "Escaped file content:\n$FILE_CONTENT" >&2
+        CONTENT=$(echo "$PROMPT_CONTENT\n\nAttached file content:\n$FILE_CONTENT" | clean_and_escape_json)
+        [[ "$VERBOSE" = "true" ]] && echo "Combined content:\n$CONTENT" >&2
+    else
+        CONTENT="$PROMPT_CONTENT"
+    fi
+
+    local REQ_BODY="{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": $CONTENT}]}"
+    TMP_FILE="$(mktemp -t "ask.grok")"
+    echo "$REQ_BODY" > "$TMP_FILE"
+    send_grok_request "$MODEL" "$VERBOSE" "$TMP_FILE"
+}
+
+# Function: parse_arguments
+parse_arguments() {
+    local OPTIND opt
+    local USE_GLOW="false"
+    local MODEL="grok-3"
+    local ATTACHED_FILE=""
+    local VERBOSE="false"
+    local PROMPT=""
+    
+    while getopts ":p:m:f:gvhi" opt; do
+        case "$opt" in
+            p)
+                if [ -z "$OPTARG" ]; then
+                    echo "Error: -p requires a prompt file path"
+                    exit 1
+                fi
+                if [ ! -f "$OPTARG" ]; then
+                    echo "Error: File not found: $OPTARG" >&2
+                    exit 1
+                fi
+                PROMPT="$(cat "$OPTARG")"
+                ;;
+            m)
+                if [ -z "$OPTARG" ]; then
+                    echo "Error: -m requires a model name" >&2
+                    usage
+                fi
+                MODEL="$OPTARG"
+                ;;
+            f)
+                if [ -z "$OPTARG" ]; then
+                    echo "Error: -f requires a file path"
+                    exit 1
+                fi
+                ATTACHED_FILE="$OPTARG"
+                ;;
+            g)
+                USE_GLOW="true"
+                ;;
+            v)
+                VERBOSE="true"
+                ;;
+            h)
+                usage
+                ;;
+            i)
+                list_available_models "$VERBOSE"
+                exit 0
+                ;;
+            \?)
+                echo "Error: Invalid option -$OPTARG" >&2
+                usage
+                ;;
+            :)
+                echo "Error: Option -$OPTARG requires an argument" >&2
+                usage
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    if [ $# -gt 0 ]; then
+        PROMPT="$PROMPT\n$*"
+    fi
+
+    jq -R --null-input \
+    --arg model "$MODEL" \
+    --arg glow "$USE_GLOW" \
+    --arg file "$ATTACHED_FILE" \
+    --arg verbose "$VERBOSE" \
+    --arg prompt "$PROMPT" \
+    '{
+        model: $model,
+        glow: $glow,
+        attached_File: $file,
+        verbose: $verbose,
+        prompt: $prompt
+    }' | base64
+}
+
+# Check for -i option early to avoid unnecessary processing
+if [[ "$1" == "-i" ]]; then
+    list_available_models "false"
+    exit 0
+fi
+
+main() {
+    for i in $(find /var/folders -regex ".*ask\.grok.*" 2>/dev/null); do
+        rm "$i" 2>/dev/null
+    done
+
+    if [[ -z "$XAI_API_KEY" ]]; then
+        echo "Error: XAI_API_KEY environment variable is not set or is empty." >&2
+        echo "Please set it to your Grok API key." >&2
+        echo "For more information, visit https://x.ai/api" >&2
+        exit 1
+    fi
+
+    if [[ -z "$(jq --null-input '{}')" ]]; then
+        echo "\nError: Check jq is installed and accessible.\n" >&2
+        exit 1
+    fi
+    if [[ -z "$(which curl)" ]]; then
+        echo "\nError: Check curl is installed and accessible.\n" >&2
+        exit 1
+    fi
+
+    if [[ $# -eq 0 && ! -s /dev/stdin && ! -p /dev/stdin ]]; then
+        usage
+        exit 1
+    fi
+
+    local PARAMS="$(parse_arguments $@)"
+    if [[ -z "$PARAMS" ]]; then
+        exit
+    fi
+    local USE_GLOW="$(echo "$PARAMS" | base64 --decode | jq -r '.glow')"
+    local MODEL="$(echo "$PARAMS" | base64 --decode | jq -r '.model')"
+    local ATTACHED_FILE="$(echo "$PARAMS" | base64 --decode | jq -r '.attached_File')"
+    local VERBOSE="$(echo "$PARAMS" | base64 --decode | jq -r '.verbose')"
+    local PROMPT="$(echo "$PARAMS" | base64 --decode | jq -r '.prompt')"
+
+    [ "$VERBOSE" = "true" ] && echo "\nParsed parameters: $(echo "$PARAMS" | base64 --decode)\n" >&2
+
+    if [[ -s /dev/stdin || -p /dev/stdin ]]; then
+        if [[ -z "$PROMPT" ]]; then
+            PROMPT="$(cat -)"
+        else
+            PROMPT="$PROMPT\n$(cat -)"
+        fi
+    fi
+
+    if [ -z "$PROMPT" ]; then
+        echo "Error: No prompt provided"
+        usage
+        exit 1
+    fi
+
+    if [[ -n "$ATTACHED_FILE" ]]; then
+        [[ "$VERBOSE" = "true" ]] && echo "Sending prompt with attached file to Grok API..." >&2
+        RESPONSE="$(send_prompt_with_file_to_grok "$(echo "$PROMPT" | base64)" "$ATTACHED_FILE" "$MODEL" "$VERBOSE")"
+    else
+        [ "$VERBOSE" = "true" ] && echo "Sending prompt to Grok API..." >&2
+        RESPONSE="$(send_prompt_to_grok "$(echo "$PROMPT" | base64)" "$MODEL" "$VERBOSE")"
+    fi
+
+    if [ "$USE_GLOW" = "true" ]; then
+        echo "$RESPONSE" | base64 --decode | glow
+    else
+        [ "$VERBOSE" = "true" ] && echo -n "\nMessage:\n\n\t" >&2
+        echo "$RESPONSE" | base64 --decode
+    fi
+}
+
+main $@
